@@ -15,11 +15,21 @@ const (
 	IDTypeDefaultMode               = IDTypeString
 )
 
+// OperationType specifies which GraphQL operation to convert
+type OperationType string
+
+const (
+	OperationQuery    OperationType = "query"
+	OperationMutation OperationType = "mutation"
+)
+
 // Options contains configuration options for the conversion process
 type Options struct {
-	IgnoreInternals    bool          `json:"ignoreInternals"`
-	NullableArrayItems bool          `json:"nullableArrayItems"`
-	IDTypeMapping      IDTypeMapping `json:"idTypeMapping"`
+	IgnoreInternals    bool           `json:"ignoreInternals"`
+	NullableArrayItems bool           `json:"nullableArrayItems"`
+	IDTypeMapping      IDTypeMapping  `json:"idTypeMapping"`
+	Operation          *OperationType `json:"operation,omitempty"`
+	MethodName         string         `json:"methodName,omitempty"`
 }
 
 // DefaultOptions returns the default conversion options
@@ -28,6 +38,8 @@ func DefaultOptions() Options {
 		IgnoreInternals:    true,
 		NullableArrayItems: false,
 		IDTypeMapping:      IDTypeDefaultMode,
+		Operation:          nil,
+		MethodName:         "",
 	}
 }
 
@@ -127,24 +139,90 @@ func FromIntrospectionQuery(introspection IntrospectionQuery, opts *Options) (*J
 		Definitions: make(map[string]*JSONSchema6),
 	}
 
-	if introspection.Schema.QueryType != nil && introspection.Schema.Types != nil {
-		queryType := findType(introspection.Schema.Types, introspection.Schema.QueryType.Name)
-		if queryType != nil {
-			schema.Properties["Query"] = processType(*queryType, opts)
+	// Track which definitions are actually used
+	usedDefinitions := make(map[string]bool)
+
+	if opts.MethodName != "" {
+		// Look for the method in both Query and Mutation types
+		var methodField *IntrospectionField
+		var methodType string
+
+		// Check Query type
+		if introspection.Schema.QueryType != nil {
+			queryType := findType(introspection.Schema.Types, introspection.Schema.QueryType.Name)
+			if queryType != nil {
+				if field := findField(queryType.Fields, opts.MethodName); field != nil {
+					methodField = field
+					methodType = "Query"
+				}
+			}
+		}
+
+		// Check Mutation type if not found in Query
+		if methodField == nil && introspection.Schema.MutationType != nil {
+			mutationType := findType(introspection.Schema.Types, introspection.Schema.MutationType.Name)
+			if mutationType != nil {
+				if field := findField(mutationType.Fields, opts.MethodName); field != nil {
+					methodField = field
+					methodType = "Mutation"
+				}
+			}
+		}
+
+		if methodField == nil {
+			return nil, fmt.Errorf("method %s not found in schema", opts.MethodName)
+		}
+
+		// Create a schema just for this method
+		methodSchema := processField(*methodField, opts)
+		schema.Properties[methodType] = &JSONSchema6{
+			Type: "object",
+			Properties: map[string]*JSONSchema6{
+				opts.MethodName: methodSchema,
+			},
+		}
+
+		// Collect all definitions used by this method
+		collectFieldDefinitions(*methodField, usedDefinitions)
+	} else if opts.Operation != nil {
+		switch *opts.Operation {
+		case OperationQuery:
+			if introspection.Schema.QueryType != nil && introspection.Schema.Types != nil {
+				queryType := findType(introspection.Schema.Types, introspection.Schema.QueryType.Name)
+				if queryType != nil {
+					schema.Properties["Query"] = processTypeAndCollectDefs(*queryType, opts, usedDefinitions)
+				}
+			}
+		case OperationMutation:
+			if introspection.Schema.MutationType != nil && introspection.Schema.Types != nil {
+				mutationType := findType(introspection.Schema.Types, introspection.Schema.MutationType.Name)
+				if mutationType != nil {
+					schema.Properties["Mutation"] = processTypeAndCollectDefs(*mutationType, opts, usedDefinitions)
+				}
+			}
+		}
+	} else {
+		// Process both if no specific operation is requested
+		if introspection.Schema.QueryType != nil && introspection.Schema.Types != nil {
+			queryType := findType(introspection.Schema.Types, introspection.Schema.QueryType.Name)
+			if queryType != nil {
+				schema.Properties["Query"] = processTypeAndCollectDefs(*queryType, opts, usedDefinitions)
+			}
+		}
+
+		if introspection.Schema.MutationType != nil && introspection.Schema.Types != nil {
+			mutationType := findType(introspection.Schema.Types, introspection.Schema.MutationType.Name)
+			if mutationType != nil {
+				schema.Properties["Mutation"] = processTypeAndCollectDefs(*mutationType, opts, usedDefinitions)
+			}
 		}
 	}
 
-	if introspection.Schema.MutationType != nil && introspection.Schema.Types != nil {
-		mutationType := findType(introspection.Schema.Types, introspection.Schema.MutationType.Name)
-		if mutationType != nil {
-			schema.Properties["Mutation"] = processType(*mutationType, opts)
-		}
-	}
-
+	// Add only the definitions that are actually used
 	if introspection.Schema.Types != nil {
 		filteredTypes := filterTypes(introspection.Schema.Types, opts.IgnoreInternals)
 		for _, t := range filteredTypes {
-			if !isRootType(t.Name) {
+			if !isRootType(t.Name) && (usedDefinitions[t.Name] || (opts.Operation == nil && opts.MethodName == "")) {
 				schema.Definitions[t.Name] = processType(t, opts)
 			}
 		}
@@ -154,6 +232,68 @@ func FromIntrospectionQuery(introspection IntrospectionQuery, opts *Options) (*J
 }
 
 // Helper functions
+// findField finds a field by name in a slice of fields
+func findField(fields []IntrospectionField, name string) *IntrospectionField {
+	for _, field := range fields {
+		if field.Name == name {
+			return &field
+		}
+	}
+	return nil
+}
+
+// collectFieldDefinitions collects all definitions used by a field
+func collectFieldDefinitions(field IntrospectionField, usedDefs map[string]bool) {
+	// Collect definitions from the return type
+	collectTypeRefDefinitions(field.Type, usedDefs)
+
+	// Collect definitions from arguments
+	for _, arg := range field.Args {
+		collectTypeRefDefinitions(arg.Type, usedDefs)
+	}
+}
+
+// processTypeAndCollectDefs processes a type and tracks all definitions used
+func processTypeAndCollectDefs(t IntrospectionType, opts *Options, usedDefs map[string]bool) *JSONSchema6 {
+	schema := processType(t, opts)
+	collectDefinitions(t, usedDefs)
+	return schema
+}
+
+// collectDefinitions recursively collects all type definitions used by a type
+func collectDefinitions(t IntrospectionType, usedDefs map[string]bool) {
+	switch t.Kind {
+	case "OBJECT", "INTERFACE":
+		for _, field := range t.Fields {
+			collectTypeRefDefinitions(field.Type, usedDefs)
+			for _, arg := range field.Args {
+				collectTypeRefDefinitions(arg.Type, usedDefs)
+			}
+		}
+	case "INPUT_OBJECT":
+		for _, field := range t.InputFields {
+			collectTypeRefDefinitions(field.Type, usedDefs)
+		}
+	case "UNION":
+		for _, possibleType := range t.PossibleTypes {
+			usedDefs[possibleType.Name] = true
+		}
+	}
+}
+
+// collectTypeRefDefinitions recursively collects all definitions used by a type reference
+func collectTypeRefDefinitions(typeRef IntrospectionTypeRef, usedDefs map[string]bool) {
+	switch typeRef.Kind {
+	case "NON_NULL", "LIST":
+		if typeRef.OfType != nil {
+			collectTypeRefDefinitions(*typeRef.OfType, usedDefs)
+		}
+	case "OBJECT", "INTERFACE", "UNION", "ENUM", "INPUT_OBJECT":
+		if typeRef.Name != nil {
+			usedDefs[*typeRef.Name] = true
+		}
+	}
+}
 
 func isRootType(name string) bool {
 	return name == "Query" || name == "Mutation"

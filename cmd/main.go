@@ -26,6 +26,8 @@ var (
 	ignoreInternals    bool
 	nullableArrayItems bool
 	idTypeMapping      string
+	operation          string
+	methodName         string
 )
 
 // Define the introspection query
@@ -195,6 +197,8 @@ func init() {
 	rootCmd.Flags().BoolVar(&ignoreInternals, "ignore-internals", true, "ignore GraphQL internal types")
 	rootCmd.Flags().BoolVar(&nullableArrayItems, "nullable-array-items", false, "properly represent nullable items in arrays")
 	rootCmd.Flags().StringVar(&idTypeMapping, "id-type", "string", "how to represent ID type (string, number, or both)")
+	rootCmd.Flags().StringVarP(&operation, "operation", "p", "", "operation type to process (query or mutation)")
+	rootCmd.Flags().StringVarP(&methodName, "method", "m", "", "specific method name to process")
 
 	// Bind flags to viper
 	viper.BindPFlag("input", rootCmd.Flags().Lookup("input"))
@@ -205,6 +209,8 @@ func init() {
 	viper.BindPFlag("ignore-internals", rootCmd.Flags().Lookup("ignore-internals"))
 	viper.BindPFlag("nullable-array-items", rootCmd.Flags().Lookup("nullable-array-items"))
 	viper.BindPFlag("id-type", rootCmd.Flags().Lookup("id-type"))
+	viper.BindPFlag("operation", rootCmd.Flags().Lookup("operation"))
+	viper.BindPFlag("method", rootCmd.Flags().Lookup("method"))
 }
 
 type GraphQLResponse struct {
@@ -310,7 +316,6 @@ func runConversion() error {
 
 	// Try getting data from endpoint first
 	if endpoint := viper.GetString("endpoint"); endpoint != "" {
-		fmt.Fprintf(os.Stderr, "Fetching schema from endpoint: %s\n", endpoint)
 		introspection, err = getIntrospectionFromEndpoint(endpoint, viper.GetStringSlice("headers"))
 		if err != nil {
 			return err
@@ -342,10 +347,27 @@ func runConversion() error {
 		return fmt.Errorf("invalid id-type mapping: %s", idMapping)
 	}
 
+	// Set up options
+	var op *pkg.OperationType
+	if opStr := viper.GetString("operation"); opStr != "" {
+		switch opStr {
+		case "query":
+			queryOp := pkg.OperationQuery
+			op = &queryOp
+		case "mutation":
+			mutationOp := pkg.OperationMutation
+			op = &mutationOp
+		default:
+			return fmt.Errorf("invalid operation type: %s (must be 'query' or 'mutation')", opStr)
+		}
+	}
+
 	opts := pkg.Options{
 		IgnoreInternals:    viper.GetBool("ignore-internals"),
 		NullableArrayItems: viper.GetBool("nullable-array-items"),
 		IDTypeMapping:      idMapping,
+		Operation:          op,
+		MethodName:         viper.GetString("method"),
 	}
 
 	// Convert to JSON Schema
@@ -383,7 +405,6 @@ func runConversion() error {
 
 func Execute() error {
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
 		return err
 	}
 	return nil
